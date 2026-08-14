@@ -1,0 +1,19 @@
+{
+  "app_key": "digital_vault",
+  "display_name": "デジタル金庫",
+  "version": "0.1.0",
+  "requested_scopes": [
+    {
+      "scope": "schedule_items:write",
+      "purpose": "パスポート・保険証書等の有効期限を共通の予定表に登録するため"
+    },
+    {
+      "scope": "schedule_items:read",
+      "purpose": "他アプリの予定と重複しないよう、更新期限の通知タイミングを確認するため"
+    },
+    {
+      "scope": "memory:write:vault.*",
+      "purpose": "有効期限が近い書類があることを他アプリ(統合コンソールの警告表示等)と共有するため"
+    }
+  ]
+}

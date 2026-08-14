@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>デジタル金庫</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.4rem; }
+  .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+  .row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+  label { display: block; font-size: 0.85rem; color: #555; margin-bottom: 0.2rem; }
+  input, select, textarea { padding: 0.4rem; border: 1px solid #ccc; border-radius: 4px; font-size: 0.95rem; }
+  button { padding: 0.5rem 1rem; border: none; border-radius: 4px; background: #2b6cb0; color: white; cursor: pointer; }
+  button.secondary { background: #718096; }
+  button.danger { background: #c53030; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  .warn { background: #fff8e1; border: 1px solid #f0d878; padding: 0.6rem; border-radius: 6px; font-size: 0.85rem; }
+  .item { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #eee; padding: 0.6rem 0; }
+  .item small { color: #888; }
+  .hidden { display: none; }
+  #status { font-size: 0.85rem; color: #888; margin-top: 0.5rem; }
+</style>
+</head>
+<body>
+
+<h1>🔒 デジタル金庫</h1>
+
+<!-- ロック画面 -->
+<div id="lockScreen" class="card">
+  <p>パスフレーズは、このページのJavaScript内でのみ使われます。サーバーには一切送信されません。<br>
+     <strong>忘れると、保存した書類は誰にも復元できません。</strong></p>
+
+  <div class="row">
+    <div>
+      <label for="passphraseInput">パスフレーズ</label>
+      <input type="password" id="passphraseInput" placeholder="忘れないものを設定してください" autocomplete="off">
+    </div>
+  </div>
+
+  <div class="row">
+    <button id="unlockOnceBtn">毎回入力して開く</button>
+    <button id="unlockAndSaveBtn" class="secondary">この端末に保存して開く</button>
+  </div>
+  <div id="credentialApiWarning" class="warn hidden">
+    お使いのブラウザは「この端末に保存」機能(Credential Management API)に対応していません。
+    毎回入力モードのみ利用できます。
+  </div>
+  <div id="status"></div>
+</div>
+
+<!-- メイン画面(unlock後に表示) -->
+<div id="mainScreen" class="hidden">
+  <div class="card">
+    <div class="row" style="justify-content: space-between;">
+      <span>🔓 ロック解除済み</span>
+      <button id="lockBtn" class="secondary">ロックする</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 style="font-size:1.1rem;">新しい書類を追加</h2>
+    <div class="row">
+      <div>
+        <label for="itemCategory">種別</label>
+        <select id="itemCategory">
+          <option value="passport">パスポート</option>
+          <option value="insurance">保険証書</option>
+          <option value="license">免許・資格</option>
+          <option value="warranty">保証書</option>
+          <option value="other">その他</option>
+        </select>
+      </div>
+      <div>
+        <label for="itemTitle">タイトル</label>
+        <input type="text" id="itemTitle" placeholder="例: パスポート(2030年まで)">
+      </div>
+      <div>
+        <label for="itemExpiry">有効期限(任意)</label>
+        <input type="date" id="itemExpiry">
+      </div>
+    </div>
+    <div class="row">
+      <div style="flex:1;">
+        <label for="itemNote">メモ(任意)</label>
+        <textarea id="itemNote" rows="2" style="width:100%;"></textarea>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="itemFile">ファイル添付(任意。画像・PDF等)</label>
+        <input type="file" id="itemFile">
+      </div>
+    </div>
+    <button id="addItemBtn">暗号化して保存</button>
+    <div id="addStatus" style="font-size:0.85rem; margin-top:0.4rem;"></div>
+  </div>
+
+  <div class="card">
+    <h2 style="font-size:1.1rem;">保存済みの書類</h2>
+    <div id="itemList"></div>
+  </div>
+</div>
+
+<script>
+// ============================================================
+// 暗号化まわり(archlifeのArchLifeApp.jsxと同じ方式: PBKDF2 → AES-GCM)
+// ただしdigital-vaultは単一プロフィール専用で anonId は使わないため、
+// PBKDF2の出力は鍵(32byte)だけにしている。
+// ============================================================
+const APP_SALT = "digital-vault-v1";
+const PBKDF2_ITERATIONS = 150000;
+
+async function deriveKey(passphrase) {
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: new TextEncoder().encode(APP_SALT), iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+    keyMaterial, 32 * 8
+  );
+  return crypto.subtle.importKey("raw", bits, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+
+function bufToB64(buf) { return btoa(String.fromCharCode(...new Uint8Array(buf))); }
+function b64ToBuf(b64) {
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr.buffer;
+}
+
+async function encryptJSON(key, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const data = new TextEncoder().encode(JSON.stringify(obj));
+  const cipherBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data);
+  return { iv: bufToB64(iv), ciphertext: bufToB64(cipherBuf) };
+}
+async function decryptJSON(key, blob) {
+  const plainBuf = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64ToBuf(blob.iv) }, key, b64ToBuf(blob.ciphertext));
+  return JSON.parse(new TextDecoder().decode(plainBuf));
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(",")[1]); // "data:...;base64,XXXX" のXXXX部分
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+// ============================================================
+// パスフレーズの入手方法(2モード)
+//   - 毎回入力: JS変数にのみ保持。ページを閉じる/再読み込みで消える。
+//   - この端末に保存: ブラウザの Credential Management API
+//     (navigator.credentials)を使う。ブラウザ自身のパスワード管理機能に
+//     保存を委ねるだけで、このアプリのコードやサーバー側には一切保存しない。
+//     未対応ブラウザでは自動的に「毎回入力」にフォールバックする。
+// ============================================================
+let currentKey = null; // 平文パスフレーズはここにも保持しない。鍵(CryptoKey)だけを持つ。
+
+function credentialApiSupported() {
+  return typeof window.PasswordCredential !== "undefined" && !!navigator.credentials;
+}
+
+async function tryAutoUnlockFromCredentialStore() {
+  if (!credentialApiSupported()) return false;
+  try {
+    // mediation: "silent" — ユーザーへのダイアログ表示無しで、既に保存済みの
+    // 認証情報があれば黙って取得を試みる。無ければ null が返るだけで
+    // エラーにはならない(=毎回入力モードの画面がそのまま出る)。
+    const cred = await navigator.credentials.get({ password: true, mediation: "silent" });
+    if (cred && cred.password) {
+      currentKey = await deriveKey(cred.password);
+      return true;
+    }
+  } catch (e) {
+    console.warn("credential auto-unlock failed", e);
+  }
+  return false;
+}
+
+async function saveCredential(passphrase) {
+  if (!credentialApiSupported()) return;
+  try {
+    const cred = new window.PasswordCredential({
+      id: "digital-vault", password: passphrase, name: "デジタル金庫",
+    });
+    await navigator.credentials.store(cred);
+  } catch (e) {
+    console.warn("credential save failed (unlock自体は続行)", e);
+  }
+}
+
+function forgetCredential() {
+  // Credential Management API自体に明示的な削除メソッドは無いため、
+  // 「ロック」時にブラウザへの自動サインイン(silent mediation)だけを
+  // 一時的に止める(preventSilentAccess)。保存済みの認証情報自体を消したい
+  // 場合は、ブラウザ本体のパスワード管理画面から削除してもらう必要がある。
+  if (navigator.credentials && navigator.credentials.preventSilentAccess) {
+    navigator.credentials.preventSilentAccess();
+  }
+}
+
+// ============================================================
+// API呼び出し(サーバーはciphertext/ivしか受け取らない)
+// ============================================================
+async function apiPut(itemKey, category, expiryDate, ciphertext, iv) {
+  const r = await fetch("/api/vault/" + encodeURIComponent(itemKey), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ category: category, expiry_date: expiryDate || null, ciphertext: ciphertext, iv: iv }),
+  });
+  if (!r.ok) throw new Error("保存に失敗しました (status " + r.status + ")");
+  return r.json();
+}
+async function apiList() {
+  const r = await fetch("/api/vault");
+  if (!r.ok) throw new Error("一覧取得に失敗しました (status " + r.status + ")");
+  return r.json();
+}
+async function apiDelete(itemKey) {
+  const r = await fetch("/api/vault/" + encodeURIComponent(itemKey), { method: "DELETE" });
+  if (!r.ok) throw new Error("削除に失敗しました (status " + r.status + ")");
+  return r.json();
+}
+
+// ============================================================
+// UI
+// ============================================================
+const lockScreen = document.getElementById("lockScreen");
+const mainScreen = document.getElementById("mainScreen");
+const statusEl = document.getElementById("status");
+const itemListEl = document.getElementById("itemList");
+
+function showUnlocked() {
+  lockScreen.classList.add("hidden");
+  mainScreen.classList.remove("hidden");
+  refreshList();
+}
+
+document.getElementById("unlockOnceBtn").addEventListener("click", async () => {
+  const p = document.getElementById("passphraseInput").value;
+  if (!p) { statusEl.textContent = "パスフレーズを入力してください。"; return; }
+  currentKey = await deriveKey(p);
+  showUnlocked();
+});
+
+document.getElementById("unlockAndSaveBtn").addEventListener("click", async () => {
+  const p = document.getElementById("passphraseInput").value;
+  if (!p) { statusEl.textContent = "パスフレーズを入力してください。"; return; }
+  currentKey = await deriveKey(p);
+  await saveCredential(p);
+  showUnlocked();
+});
+
+document.getElementById("lockBtn").addEventListener("click", () => {
+  currentKey = null;
+  forgetCredential();
+  mainScreen.classList.add("hidden");
+  lockScreen.classList.remove("hidden");
+  document.getElementById("passphraseInput").value = "";
+});
+
+document.getElementById("addItemBtn").addEventListener("click", async () => {
+  const addStatus = document.getElementById("addStatus");
+  const category = document.getElementById("itemCategory").value;
+  const title = document.getElementById("itemTitle").value;
+  const expiry = document.getElementById("itemExpiry").value;
+  const note = document.getElementById("itemNote").value;
+  const fileInput = document.getElementById("itemFile");
+
+  if (!title) { addStatus.textContent = "タイトルを入力してください。"; return; }
+
+  let fileData = null;
+  if (fileInput.files.length > 0) {
+    const f = fileInput.files[0];
+    fileData = { name: f.name, mime: f.type, base64: await fileToBase64(f) };
+  }
+
+  const payload = { title: title, note: note, file: fileData };
+  const enc = await encryptJSON(currentKey, payload);
+  const itemKey = crypto.randomUUID();
+
+  addStatus.textContent = "保存中...";
+  try {
+    await apiPut(itemKey, category, expiry, enc.ciphertext, enc.iv);
+    addStatus.textContent = "保存しました。";
+    document.getElementById("itemTitle").value = "";
+    document.getElementById("itemExpiry").value = "";
+    document.getElementById("itemNote").value = "";
+    fileInput.value = "";
+    refreshList();
+  } catch (e) {
+    addStatus.textContent = "エラー: " + e.message;
+  }
+});
+
+const CATEGORY_LABELS = { passport: "パスポート", insurance: "保険証書", license: "免許・資格", warranty: "保証書", other: "その他" };
+
+async function refreshList() {
+  itemListEl.innerHTML = "読み込み中...";
+  const items = await apiList();
+  if (items.length === 0) {
+    itemListEl.innerHTML = "<p style='color:#888;'>まだ何も保存されていません。</p>";
+    return;
+  }
+  itemListEl.innerHTML = "";
+  for (const item of items) {
+    let title = "(復号エラー)";
+    let note = "";
+    let hasFile = false;
+    let decrypted = null;
+    try {
+      decrypted = await decryptJSON(currentKey, { iv: item.iv, ciphertext: item.ciphertext });
+      title = decrypted.title;
+      note = decrypted.note || "";
+      hasFile = !!decrypted.file;
+    } catch (e) {
+      console.error("decrypt failed for", item.item_key, e);
+    }
+
+    const row = document.createElement("div");
+    row.className = "item";
+    const expiryText = item.expiry_date ? (" / 期限: " + item.expiry_date) : "";
+    const syncedText = item.schedule_synced ? " / 予定表に反映済み" : "";
+    row.innerHTML =
+      '<div>' +
+        '<div>[' + (CATEGORY_LABELS[item.category] || item.category) + '] ' + title + '</div>' +
+        '<small>' + note + expiryText + syncedText + '</small>' +
+      '</div>' +
+      '<div class="row" style="margin:0;">' +
+        (hasFile ? '<button class="secondary" data-action="download">ファイルを開く</button>' : "") +
+        '<button class="danger" data-action="delete">削除</button>' +
+      '</div>';
+
+    const delBtn = row.querySelector('[data-action="delete"]');
+    if (delBtn) delBtn.addEventListener("click", async () => {
+      if (!confirm('「' + title + '」を削除します。よろしいですか?')) return;
+      await apiDelete(item.item_key);
+      refreshList();
+    });
+    const dlBtn = row.querySelector('[data-action="download"]');
+    if (dlBtn) dlBtn.addEventListener("click", () => {
+      if (!decrypted || !decrypted.file) return;
+      const link = document.createElement("a");
+      link.href = "data:" + decrypted.file.mime + ";base64," + decrypted.file.base64;
+      link.download = decrypted.file.name;
+      link.click();
+    });
+    itemListEl.appendChild(row);
+  }
+}
+
+// 起動時: 保存済みの認証情報があれば自動でロック解除を試みる
+(async function init() {
+  if (!credentialApiSupported()) {
+    document.getElementById("credentialApiWarning").classList.remove("hidden");
+    document.getElementById("unlockAndSaveBtn").disabled = true;
+  }
+  const autoUnlocked = await tryAutoUnlockFromCredentialStore();
+  if (autoUnlocked) showUnlocked();
+})();
+</script>
+</body>
+</html>
