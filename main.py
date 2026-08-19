@@ -180,7 +180,7 @@ def _sync_expiry_to_schedule(item_key: str, category: str, expiry_date: str) -> 
         return False
 
 
-@app.put("/api/vault/{item_key}")
+@app.put("/{item_key}")
 def put_item(item_key: str, body: VaultItemIn):
     if body.category not in _VALID_CATEGORIES:
         raise HTTPException(status_code=400, detail=f"categoryは{sorted(_VALID_CATEGORIES)}のいずれかで指定してください")
@@ -224,7 +224,19 @@ def put_item(item_key: str, body: VaultItemIn):
     }
 
 
-@app.get("/api/vault/{item_key}")
+@app.get("/list")
+def list_items():
+    """一覧はメタデータのみ(ciphertext/ivも含む。中身が必要ならここで
+    まとめて返す方が、health-support等の list_logs と同じくシンプル)。
+    /{item_key} より先に宣言する必要がある(FastAPIは宣言順にマッチする
+    ため、後に書くと "list" という文字列がitem_keyとして先に食われてしまう)。
+    """
+    with _vault_db() as conn:
+        rows = conn.execute("SELECT * FROM vault_items ORDER BY updated_at DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/{item_key}")
 def get_item(item_key: str):
     with _vault_db() as conn:
         row = conn.execute("SELECT * FROM vault_items WHERE item_key = ?", (item_key,)).fetchone()
@@ -233,16 +245,7 @@ def get_item(item_key: str):
     return dict(row)
 
 
-@app.get("/api/vault")
-def list_items():
-    """一覧はメタデータのみ(ciphertext/ivも含む。中身が必要ならここで
-    まとめて返す方が、health-support等の list_logs と同じくシンプル)。"""
-    with _vault_db() as conn:
-        rows = conn.execute("SELECT * FROM vault_items ORDER BY updated_at DESC").fetchall()
-    return [dict(r) for r in rows]
-
-
-@app.delete("/api/vault/{item_key}")
+@app.delete("/{item_key}")
 def delete_item(item_key: str):
     with _vault_db() as conn:
         cur = conn.execute("DELETE FROM vault_items WHERE item_key = ?", (item_key,))

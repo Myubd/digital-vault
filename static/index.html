@@ -207,7 +207,7 @@ function forgetCredential() {
 // API呼び出し(サーバーはciphertext/ivしか受け取らない)
 // ============================================================
 async function apiPut(itemKey, category, expiryDate, ciphertext, iv) {
-  const r = await fetch("/api/vault/" + encodeURIComponent(itemKey), {
+  const r = await fetch("/" + encodeURIComponent(itemKey), {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ category: category, expiry_date: expiryDate || null, ciphertext: ciphertext, iv: iv }),
@@ -216,12 +216,12 @@ async function apiPut(itemKey, category, expiryDate, ciphertext, iv) {
   return r.json();
 }
 async function apiList() {
-  const r = await fetch("/api/vault");
+  const r = await fetch("/list");
   if (!r.ok) throw new Error("一覧取得に失敗しました (status " + r.status + ")");
   return r.json();
 }
 async function apiDelete(itemKey) {
-  const r = await fetch("/api/vault/" + encodeURIComponent(itemKey), { method: "DELETE" });
+  const r = await fetch("/" + encodeURIComponent(itemKey), { method: "DELETE" });
   if (!r.ok) throw new Error("削除に失敗しました (status " + r.status + ")");
   return r.json();
 }
