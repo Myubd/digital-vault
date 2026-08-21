@@ -7,12 +7,18 @@ digital-vault / main.py
 
 【他アプリとの違い】このアプリだけは、保存するデータ本体(ciphertext/iv)を
 サーバー側で一切復号しない(ゼロ知識設計)。サーバーが平文で扱うのは
-category(粗い分類)とexpiry_date(有効期限)だけで、タイトル・メモ・
-ファイル本体はすべてクライアント側(ブラウザのWeb Crypto API)で
-暗号化された状態のまま保存・返却する。鍵はサーバーのどこにも保存しない。
+category(粗い分類)・expiry_date(有効期限)・PBKDF2のsalt(/salt)だけで、
+タイトル・メモ・ファイル本体はすべてクライアント側(ブラウザのWeb Crypto API)で
+暗号化された状態のまま保存・返却する。鍵(パスフレーズから導出したCryptoKey)は
+サーバーのどこにも保存しない。
+
+なお、より厳密には「vaultの中身についてのserver-side plaintext zero knowledge」
+であり、category・expiry_date・saltはサーバー側で平文のまま扱う設計である
+(saltは秘密情報ではないため、平文管理でも暗号強度には影響しない)。
 """
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import sqlite3
@@ -66,8 +72,38 @@ def _init_vault_db() -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vault_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     conn.close()
+
+
+def _get_or_create_salt() -> str:
+    """PBKDF2の鍵導出salt(base64)を返す。初回アクセス時にランダム生成してDBへ
+    平文で保存し、以後は同じ値を返す(device_identity.pyのkey_saltと同じ発想)。
+
+    saltは秘密情報ではない(暗号強度はパスフレーズとPBKDF2反復回数に依存する)ため、
+    平文でDBに置いても「サーバーは中身を復号しない」というゼロ知識の原則は壊れない。
+    固定文字列("digital-vault-v1")だった旧実装では、このアプリ専用の
+    レインボーテーブル的事前計算攻撃に対する耐性が無かったため、
+    vaultインスタンスごとのランダムsaltに切り替える。
+    """
+    with _vault_db() as conn:
+        row = conn.execute("SELECT value FROM vault_meta WHERE key = 'pbkdf2_salt'").fetchone()
+        if row:
+            return row["value"]
+        salt_b64 = base64.b64encode(os.urandom(16)).decode("ascii")
+        conn.execute(
+            "INSERT INTO vault_meta (key, value) VALUES ('pbkdf2_salt', ?)",
+            (salt_b64,),
+        )
+        return salt_b64
 
 
 @contextmanager
@@ -222,6 +258,14 @@ def put_item(item_key: str, body: VaultItemIn):
         "item_key": item_key, "category": row["category"], "expiry_date": row["expiry_date"],
         "schedule_synced": schedule_synced, "updated_at": row["updated_at"],
     }
+
+
+@app.get("/salt")
+def get_salt():
+    """フロント(static/index.html)はこの値を使ってderiveKey()する。
+    "/list" と同じ理由で、"/{item_key}" より前に宣言する必要がある。
+    """
+    return {"salt": _get_or_create_salt()}
 
 
 @app.get("/list")

@@ -107,19 +107,44 @@
 // 暗号化まわり(archlifeのArchLifeApp.jsxと同じ方式: PBKDF2 → AES-GCM)
 // ただしdigital-vaultは単一プロフィール専用で anonId は使わないため、
 // PBKDF2の出力は鍵(32byte)だけにしている。
+//
+// saltはこのvaultインスタンス固有のランダム値(サーバーの/saltが返す)。
+// saltは秘密情報ではない(暗号強度はパスフレーズとPBKDF2反復回数に依存する)ため、
+// 平文で取得しても「サーバーは中身を復号できない」というゼロ知識の原則は壊れない。
+// 旧実装は全インスタンス共通の固定salt("digital-vault-v1")を使っていたため、
+// このアプリ専用のレインボーテーブル的事前計算攻撃に弱かった。
 // ============================================================
-const APP_SALT = "digital-vault-v1";
+const LEGACY_APP_SALT = "digital-vault-v1"; // 旧データの救済(移行)専用。新規鍵導出には使わない。
 const PBKDF2_ITERATIONS = 150000;
+let currentSalt = null; // サーバーから取得したこのvault固有のsalt(base64はまだ)
 
-async function deriveKey(passphrase) {
+async function fetchSalt() {
+  const r = await fetch("/salt");
+  if (!r.ok) throw new Error("saltの取得に失敗しました (status " + r.status + ")");
+  const data = await r.json();
+  return data.salt; // base64文字列
+}
+
+async function _deriveKeyWithSaltBytes(passphrase, saltBytes) {
   const keyMaterial = await crypto.subtle.importKey(
     "raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveBits"]
   );
   const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt: new TextEncoder().encode(APP_SALT), iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+    { name: "PBKDF2", salt: saltBytes, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
     keyMaterial, 32 * 8
   );
   return crypto.subtle.importKey("raw", bits, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+
+async function deriveKey(passphrase) {
+  if (!currentSalt) currentSalt = await fetchSalt();
+  return _deriveKeyWithSaltBytes(passphrase, b64ToBuf(currentSalt));
+}
+
+// 旧固定salt("digital-vault-v1")で導出した鍵。既存データの復号→新saltでの
+// 再暗号化(移行)にのみ使う。新規保存には絶対に使わない。
+async function deriveLegacyKey(passphrase) {
+  return _deriveKeyWithSaltBytes(passphrase, new TextEncoder().encode(LEGACY_APP_SALT));
 }
 
 function bufToB64(buf) { return btoa(String.fromCharCode(...new Uint8Array(buf))); }
@@ -173,6 +198,7 @@ async function tryAutoUnlockFromCredentialStore() {
     const cred = await navigator.credentials.get({ password: true, mediation: "silent" });
     if (cred && cred.password) {
       currentKey = await deriveKey(cred.password);
+      await migrateLegacySaltItemsIfNeeded(cred.password);
       return true;
     }
   } catch (e) {
@@ -234,6 +260,54 @@ const mainScreen = document.getElementById("mainScreen");
 const statusEl = document.getElementById("status");
 const itemListEl = document.getElementById("itemList");
 
+// ============================================================
+// 旧固定salt("digital-vault-v1")で保存された既存データの救済(移行)。
+// 新saltでの復号に失敗した項目だけ、旧saltの鍵で復号を試み、成功したら
+// 新saltの鍵で再暗号化して保存し直す。移行不要な環境(新規vault、または
+// 既に移行済み)では何も起きない。
+// ============================================================
+async function migrateLegacySaltItemsIfNeeded(passphrase) {
+  let items;
+  try {
+    items = await apiList();
+  } catch (e) {
+    return; // 一覧取得に失敗した場合は移行をスキップ(refreshList側で通常のエラー表示に任せる)
+  }
+  if (items.length === 0) return;
+
+  const legacyKey = await deriveLegacyKey(passphrase);
+  let migratedCount = 0;
+
+  for (const item of items) {
+    // 新saltの鍵で復号できるものは移行済み(またはそもそも旧データではない)なのでスキップ
+    try {
+      await decryptJSON(currentKey, item);
+      continue;
+    } catch (e) {
+      // 新saltでの復号失敗 → 旧saltでの復号を試みる
+    }
+
+    let payload;
+    try {
+      payload = await decryptJSON(legacyKey, item);
+    } catch (e) {
+      continue; // 旧saltでも復号できない(パスフレーズ不一致等) → このアプリでは救済不能。そのまま残す
+    }
+
+    try {
+      const reEncrypted = await encryptJSON(currentKey, payload);
+      await apiPut(item.item_key, item.category, item.expiry_date, reEncrypted.ciphertext, reEncrypted.iv);
+      migratedCount++;
+    } catch (e) {
+      console.warn("項目の再暗号化に失敗しました(item_key=" + item.item_key + ")", e);
+    }
+  }
+
+  if (migratedCount > 0) {
+    statusEl.textContent = migratedCount + "件のデータを新しいsalt方式に移行しました。";
+  }
+}
+
 function showUnlocked() {
   lockScreen.classList.add("hidden");
   mainScreen.classList.remove("hidden");
@@ -244,6 +318,7 @@ document.getElementById("unlockOnceBtn").addEventListener("click", async () => {
   const p = document.getElementById("passphraseInput").value;
   if (!p) { statusEl.textContent = "パスフレーズを入力してください。"; return; }
   currentKey = await deriveKey(p);
+  await migrateLegacySaltItemsIfNeeded(p);
   showUnlocked();
 });
 
@@ -251,6 +326,7 @@ document.getElementById("unlockAndSaveBtn").addEventListener("click", async () =
   const p = document.getElementById("passphraseInput").value;
   if (!p) { statusEl.textContent = "パスフレーズを入力してください。"; return; }
   currentKey = await deriveKey(p);
+  await migrateLegacySaltItemsIfNeeded(p);
   await saveCredential(p);
   showUnlocked();
 });
